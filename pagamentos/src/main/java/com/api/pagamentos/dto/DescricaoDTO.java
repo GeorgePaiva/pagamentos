@@ -1,13 +1,13 @@
-package com.api.pagamentos.model;
+package com.api.pagamentos.dto;
 
 import lombok.Data;
 
 @Data
-public class Descricao {
+public class DescricaoDTO {
     private String valor;
     private String dataHora;
     private String estabelecimento;
     private String nsu;
     private String codigoAutorizacao;
-    private StatusTransacao status;
+    private String status;
 }
