@@ -5,8 +5,10 @@ import com.api.pagamentos.entity.DescricaoEmbeddable;
 import com.api.pagamentos.entity.FormaPagamentoEmbeddable;
 import com.api.pagamentos.entity.PagamentoEntity;
 import com.api.pagamentos.entity.enums.StatusTransacao;
+import com.api.pagamentos.entity.enums.TipoPagamento;
 import com.api.pagamentos.exception.ResourceNotFoundException;
 import com.api.pagamentos.repository.PagamentoRepository;
+import jakarta.validation.constraints.NotNull;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -16,64 +18,70 @@ import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 @Service
 public class PagamentoService {
 
+    public static final String CARD_NUMBER_REGEX = "\\d{12,19}";
     @Autowired
     private PagamentoRepository repository;
     private final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
 
     @Transactional
     public PagamentoResponse createPayment(PagamentoRequest request) {
-        validateRequest(request);
 
-        String id = UUID.randomUUID().toString();
-        String cartaoMask = maskCard(request.getCartao());
+        this.validateRequest(request);
 
-        // determinar status: regra de exemplo (último dígito do cartão par => AUTORIZADO)
-        String status = determineStatus(request.getCartao());
+        var id = UUID.randomUUID().toString();
+        var maskedCard = maskCard(request.getCartao());
+        var status = determineStatus(request.getCartao());
 
-        // montar descricao
-        DescricaoEmbeddable desc = new DescricaoEmbeddable();
-        desc.setValor(request.getValor().setScale(2).toString());
-        desc.setDataHora(OffsetDateTime.now().format(dtf));
-        desc.setEstabelecimento("PetShop Mundo cão"); // ou dynamic se necessário
-        desc.setNsu(generateNsu());
-        desc.setCodigoAutorizacao(generateCodigoAutorizacao());
-        desc.setStatus(status);
+        var descricao = buildDescricao(request.getValor(), status);
+        var formaPagamento = buildFormaPagamento(request.getFormaPagamento());
 
-        // forma pagamento
-        FormaPagamentoEmbeddable forma = new FormaPagamentoEmbeddable();
-        forma.setTipo(request.getFormaPagamento().getTipo());
-        forma.setParcelas(request.getFormaPagamento().getParcelas());
-
-        PagamentoEntity entity = new PagamentoEntity();
+        var entity = new PagamentoEntity();
         entity.setId(id);
-        entity.setCartao(cartaoMask);
-        entity.setDescricao(desc);
-        entity.setFormaPagamento(forma);
+        entity.setCartao(maskedCard);
+        entity.setDescricao(descricao);
+        entity.setFormaPagamento(formaPagamento);
         entity.setDataHora(OffsetDateTime.now());
 
         repository.save(entity);
-
         return toResponse(entity);
+    }
+
+    private DescricaoEmbeddable buildDescricao(BigDecimal valor, String status) {
+        var descricao = new DescricaoEmbeddable();
+        descricao.setValor(valor.setScale(2).toString());
+        descricao.setDataHora(OffsetDateTime.now().format(dtf));
+        descricao.setEstabelecimento("PetShop Mundo cão");
+        descricao.setNsu(generateNsu());
+        descricao.setCodigoAutorizacao(generateCodigoAutorizacao());
+        descricao.setStatus(status);
+        return descricao;
+    }
+
+    private FormaPagamentoEmbeddable buildFormaPagamento(@NotNull FormaPagamentoDTO formaPagamentoDTO) {
+        var pagamento = new FormaPagamentoEmbeddable();
+        pagamento.setTipo(formaPagamentoDTO.getTipo());
+        pagamento.setParcelas(formaPagamentoDTO.getParcelas());
+        return pagamento;
     }
 
     @Transactional
     public PagamentoResponse refund(String id) {
-        PagamentoEntity entity = repository.findById(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Transação não encontrada: " + id));
+        var entity = repository.findById(id).orElseThrow(() ->
+                new ResourceNotFoundException("Transação não encontrada: " + id));
 
-        // se já cancelado, só retorna o mesmo objeto com status CANCELADO
-        if ("CANCELADO".equalsIgnoreCase(entity.getDescricao().getStatus())) {
+        var statusAtual = entity.getDescricao().getStatus();
+
+        if (StatusTransacao.CANCELADO.getValue().equalsIgnoreCase(statusAtual)) {
             return toResponse(entity);
         }
 
-        // atualiza status
-        entity.getDescricao().setStatus("CANCELADO");
-        // opcional: atualizar codigoAutorizacao/nsu para estorno (aqui mantemos)
+        entity.getDescricao().setStatus(StatusTransacao.CANCELADO.getValue());
         repository.save(entity);
 
         return toResponse(entity);
@@ -81,8 +89,8 @@ public class PagamentoService {
 
     @Transactional(readOnly = true)
     public PagamentoResponse findById(String id) {
-        PagamentoEntity entity = repository.findById(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Transação não encontrada: " + id));
+        PagamentoEntity entity = repository.findById(id).orElseThrow(() ->
+                new ResourceNotFoundException("Transação não encontrada: " + id));
         return toResponse(entity);
     }
 
@@ -91,73 +99,109 @@ public class PagamentoService {
         return repository.findAll().stream().map(this::toResponse).collect(Collectors.toList());
     }
 
-    // ---------- helper methods ----------
     private void validateRequest(PagamentoRequest req) {
-        if (req.getValor() == null || req.getValor().compareTo(BigDecimal.ZERO) <= 0) {
-            throw new IllegalArgumentException("valor deve ser maior que zero");
-        }
-        if (req.getCartao() == null || !req.getCartao().matches("\\d{12,19}")) {
-            throw new IllegalArgumentException("cartao inválido");
-        }
-        if (req.getFormaPagamento() == null) {
-            throw new IllegalArgumentException("formaPagamento é obrigatório");
-        }
-        String tipo = req.getFormaPagamento().getTipo();
-        if (!("AVISTA".equalsIgnoreCase(tipo)
-                || "PARCELADO_LOJA".equalsIgnoreCase(tipo)
-                || "PARCELADO_EMISSOR".equalsIgnoreCase(tipo))) {
+        var forma = getFormaPagamentoDTO(req);
+
+        var tipo = forma.getTipo();
+        var isTipoInvalido = !(TipoPagamento.AVISTA.getValue().equalsIgnoreCase(tipo) || TipoPagamento.PARCELADO_LOJA
+                .getValue().equalsIgnoreCase(tipo) || TipoPagamento.PARCELADO_EMISSOR.getValue().equalsIgnoreCase(tipo));
+
+        if (isTipoInvalido) {
             throw new IllegalArgumentException("tipo de pagamento inválido");
         }
     }
 
+    private static FormaPagamentoDTO getFormaPagamentoDTO(PagamentoRequest req) {
+        var valor = req.getValor();
+        var cartao = req.getCartao();
+        var forma = req.getFormaPagamento();
+
+        if (valor == null || valor.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("valor deve ser maior que zero");
+        }
+
+        if (cartao == null || !cartao.matches(CARD_NUMBER_REGEX)) {
+            throw new IllegalArgumentException("cartao inválido");
+        }
+
+        if (forma == null) {
+            throw new IllegalArgumentException("formaPagamento é obrigatório");
+        }
+        return forma;
+    }
+
     private String maskCard(String card) {
-        int len = card.length();
-        if (len <= 8) return card; // caso raro
-        String last4 = card.substring(len - 4);
-        return card.substring(0, 4) + "********" + last4; // formatação similar à imagem
+        if (card == null || card.length() <= 8) {
+            return card;
+        }
+
+        var length = card.length();
+        var first4 = card.substring(0, 4);
+        var last4 = card.substring(length - 4);
+
+        return first4 + "********" + last4;
     }
 
     private String determineStatus(String card) {
-        char last = card.charAt(card.length() - 1);
-        if (!Character.isDigit(last)) return StatusTransacao.NEGADO.getValue();
-        int d = Character.getNumericValue(last);
-        return (d % 2 == 0) ? StatusTransacao.AUTORIZADO.getValue() : StatusTransacao.NEGADO.getValue();
+        if (card == null || card.isBlank()) {
+            return StatusTransacao.NEGADO.getValue();
+        }
+
+        var lastChar = card.charAt(card.length() - 1);
+
+        if (!Character.isDigit(lastChar)) {
+            return StatusTransacao.NEGADO.getValue();
+        }
+
+        var lastDigit = Character.getNumericValue(lastChar);
+        var isEven = lastDigit % 2 == 0;
+
+        return isEven ? StatusTransacao.AUTORIZADO.getValue() : StatusTransacao.NEGADO.getValue();
     }
 
     private String generateNsu() {
-        return String.valueOf(Math.abs(UUID.randomUUID().getMostSignificantBits())).replace("-", "").substring(0, 10);
+        var randomBits = Math.abs(UUID.randomUUID().getMostSignificantBits());
+        var digits = Long.toString(randomBits).replace("-", "");
+
+        return digits.length() >= 10 ? digits.substring(0, 10) : String.format("%010d", randomBits).substring(0, 10);
     }
 
     private String generateCodigoAutorizacao() {
-        int n = (int) (Math.random() * 900000000) + 100000000;
-        return String.valueOf(n);
+        var number = ThreadLocalRandom.current().nextInt(100_000_000, 1_000_000_000);
+        return Integer.toString(number);
     }
 
     private PagamentoResponse toResponse(PagamentoEntity entity) {
-        PagamentoResponse resp = new PagamentoResponse();
 
-        TransacaoDTO t = new TransacaoDTO();
-        t.setCartao(entity.getCartao());
-        t.setId(entity.getId());
+        var descricaoSrc = entity.getDescricao();
+        var formaSrc = entity.getFormaPagamento();
 
-        DescricaoDTO d = new DescricaoDTO();
-        DescricaoEmbeddable src = entity.getDescricao();
-        d.setValor(src.getValor());
-        d.setDataHora(src.getDataHora());
-        d.setEstabelecimento(src.getEstabelecimento());
-        d.setNsu(src.getNsu());
-        d.setCodigoAutorizacao(src.getCodigoAutorizacao());
-        d.setStatus(src.getStatus());
+        var transacao = getTransacaoDTO(entity, descricaoSrc);
 
-        t.setDescricao(d);
-        resp.setTransacao(t);
+        var forma = new FormaPagamentoDTO();
+        forma.setTipo(formaSrc.getTipo());
+        forma.setParcelas(formaSrc.getParcelas());
 
-        FormaPagamentoDTO f = new FormaPagamentoDTO();
-        FormaPagamentoEmbeddable fe = entity.getFormaPagamento();
-        f.setTipo(fe.getTipo());
-        f.setParcelas(fe.getParcelas());
-        resp.setFormaPagamento(f);
+        var response = new PagamentoResponse();
+        response.setTransacao(transacao);
+        response.setFormaPagamento(forma);
 
-        return resp;
+        return response;
+    }
+
+    private static TransacaoDTO getTransacaoDTO(PagamentoEntity entity, DescricaoEmbeddable descricaoSrc) {
+        var descricao = new DescricaoDTO();
+        descricao.setValor(descricaoSrc.getValor());
+        descricao.setDataHora(descricaoSrc.getDataHora());
+        descricao.setEstabelecimento(descricaoSrc.getEstabelecimento());
+        descricao.setNsu(descricaoSrc.getNsu());
+        descricao.setCodigoAutorizacao(descricaoSrc.getCodigoAutorizacao());
+        descricao.setStatus(descricaoSrc.getStatus());
+
+        var transacao = new TransacaoDTO();
+        transacao.setId(entity.getId());
+        transacao.setCartao(entity.getCartao());
+        transacao.setDescricao(descricao);
+        return transacao;
     }
 }
